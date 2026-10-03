@@ -1,171 +1,152 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-interpretar.py -- traduz a saida numerica do miniSAT em um plano legivel.
+# Mundo dos Blocos de Tamanho Variável → SAT
 
-O miniSAT so devolve inteiros (IDs de variaveis verdadeiras). A traducao
-"inteiro -> simbolo" vem do arquivo .map gerado por bw2cnf_var.py.
-Sem o .map a saida do solver nao tem significado (Regra de Ouro, Secao 7.4).
+Planejamento no Mundo dos Blocos com blocos de comprimentos diferentes, resolvido por **redução a SAT**: o problema é codificado em CNF (DIMACS), resolvido pelo `minisat` e a resposta numérica é traduzida de volta para um plano legível. Um verificador independente (BFS, sem SAT) confere os planos.
 
-Passos:
-  1. le o mapa (ID -> simbolo)
-  2. filtra os literais positivos
-  3. reune as acoes mv(b,y,p,t), ordena por t e traduz para portugues
-  4. (--verbose) reconstroi o estado em cada t e deriva a relacao 'on'
+## Domínio
 
-Uso:
-    python3 interpretar.py situacao3/resultado3.txt [--map situacao3/trab01_blocos2SAT.map] [--verbose]
-(sem --map, usa o trab01_blocos2SAT.map da mesma pasta do resultado)
-"""
-import argparse
-import os
-import re
-import sys
+| Item | Valor |
+|---|---|
+| Blocos | `a`=1, `b`=1, `c`=2, `d`=3 (comprimento em slots) |
+| Mesa | 6 slots (pontos 0..6) |
+| Níveis | 0..3 (0 = mesa) |
+| Ação | `move(b, y, p)`: move o bloco `b` para cima de `y` (ou da mesa `T`) começando no ponto `p` |
 
-BLOCKS = {'a': 1, 'b': 1, 'c': 2, 'd': 3}
-TABLE = 'T'
+Regras da ação (pré-condições): P1 `b` livre · P2 destino válido · P3 sobreposição com `y` · P4 slots livres no nível-alvo · P5 folga vertical · P6 estabilidade (≥ ⌈l(b)/2⌉ slots apoiados) · P7 ação não nula.
 
-RE_MV = re.compile(r'^mv\((\w),(\w),(\d+),(\d+)\)$')
-RE_AT = re.compile(r'^at\((\w),(\d+),(\d+)\)$')
-RE_LEV = re.compile(r'^lev\((\w),(\d+),(\d+)\)$')
+## Arquivos
 
+| Arquivo | Função |
+|---|---|
+| `bw2cnf_var.py` | Define blocos e cenários; gera o CNF (`.cnf`) e o mapa de variáveis (`.map`) |
+| `rodar_cenarios.py` | Automatiza tudo: gera o CNF, roda o minisat com `T = 0, 1, 2, …` até `SATISFIABLE`, interpreta e verifica o plano |
+| `interpretar.py` | Traduz a saída numérica do minisat (usando o `.map`) em um plano em português |
+| `busca_exaustiva.py` | Verificador independente (BFS): acha o plano mínimo e valida planos do SAT |
 
-def ler_mapa(caminho):
-    mapa = {}
-    with open(caminho) as f:
-        for linha in f:
-            linha = linha.strip()
-            if not linha:
-                continue
-            idx, nome = linha.split(None, 1)
-            mapa[int(idx)] = nome
-    return mapa
+## Requisitos
 
+- Python 3.8+ (somente biblioteca padrão)
+- [`minisat`](http://minisat.se/) no `PATH` (`sudo apt install minisat`)
 
-def ler_resultado(caminho):
-    """Retorna (satisfiavel, conjunto de IDs verdadeiros)."""
-    with open(caminho) as f:
-        linhas = [l.strip() for l in f if l.strip()]
-    if not linhas:
-        raise SystemExit('Arquivo de resultado vazio.')
-    if linhas[0].upper().startswith('UNSAT'):
-        return False, set()
-    if not linhas[0].upper().startswith('SAT'):
-        raise SystemExit(f'Formato inesperado na 1a linha: {linhas[0]!r}')
-    ids = set()
-    for linha in linhas[1:]:
-        for tok in linha.split():
-            n = int(tok)
-            if n > 0:
-                ids.add(n)
-    return True, ids
+## Cenários
 
+| Nome | Descrição | Menor plano |
+|---|---|---|
+| `sit1_sf4` | Situação 1 (com ordem parcial: `d` na mesa antes de `a` sobre `c`) | 4 |
+| `sit2` | Situação 2, S0 → S5 (com ordem parcial) | 5 |
+| `sit3` | Situação 3, S0 → S7 (com ordem parcial) | 6 |
+| `sit1_sf1`, `sit1_sf2`, `sit1_sf3` | Metas extras da Situação 1 (sem ordem parcial) | 9, 10, 10 |
 
-def spans_overlap(b1, p1, b2, p2):
-    return p1 < p2 + BLOCKS[b2] and p2 < p1 + BLOCKS[b1]
+## Uso (fluxo do Manual, Seção 6)
 
+São 3 passos: **gerar CNF → rodar o miniSAT → interpretar**.
 
-def derivar_on(estado):
-    """
-    estado: {bloco: (p, l)}. Retorna {bloco: [apoios]} (apoio = bloco ou 'T').
-    on(b,y) <-> lev(b)=l, lev(y)=l-1 e os spans se sobrepoem (ponte: varios apoios).
-    """
-    on = {}
-    for b, (p, l) in estado.items():
-        if l == 0:
-            on[b] = [TABLE]
-        else:
-            on[b] = sorted(y for y, (q, m) in estado.items()
-                           if y != b and m == l - 1 and spans_overlap(b, p, y, q))
-    return on
+**1. Gerar o CNF** — sem argumentos, cria as três pastas de uma vez, cada uma com o `.cnf` e o `.map`:
 
+```bash
+python3 bw2cnf_var.py
+```
 
-def estados_por_tempo(mapa, verdadeiros):
-    at, lev = {}, {}
-    for v in verdadeiros:
-        nome = mapa.get(v, '')
-        m = RE_AT.match(nome)
-        if m:
-            at[(m.group(1), int(m.group(3)))] = int(m.group(2))
-            continue
-        m = RE_LEV.match(nome)
-        if m:
-            lev[(m.group(1), int(m.group(3)))] = int(m.group(2))
-    ts = sorted({t for (_, t) in at})
-    return {t: {b: (at[(b, t)], lev[(b, t)]) for b in BLOCKS if (b, t) in at and (b, t) in lev}
-            for t in ts}
+```
+[sit1_sf4] 1146 variaveis, 31390 clausulas (...), horizonte T=4
+  Arquivos: situacao1/trab01_blocos2SAT.cnf, situacao1/trab01_blocos2SAT.map
+[sit2] ...  -> situacao2/
+[sit3] ...  -> situacao3/
+```
 
+Para gerar só um cenário (ou outro horizonte):
 
-def acoes(mapa, verdadeiros):
-    plano = []
-    for v in verdadeiros:
-        m = RE_MV.match(mapa.get(v, ''))
-        if m:
-            plano.append((int(m.group(4)), m.group(1), m.group(2), int(m.group(3))))
-    return sorted(plano)
+```bash
+python3 bw2cnf_var.py --cenario sit2
+python3 bw2cnf_var.py --cenario sit3 --horizon 6
+python3 bw2cnf_var.py --cenario sit1_sf1 sit1_sf2     # extras, em situacao1/extras_*
+```
 
+**2. Executar o miniSAT** — grava o `resultadoX.txt` na mesma pasta:
 
-def frase(b, y, p):
-    if y == TABLE:
-        return f"mover bloco '{b}' para a MESA em p={p}"
-    return f"mover bloco '{b}' para CIMA de '{y}' em p={p}"
+```bash
+minisat situacao1/trab01_blocos2SAT.cnf situacao1/resultado1.txt
+minisat situacao2/trab01_blocos2SAT.cnf situacao2/resultado2.txt
+minisat situacao3/trab01_blocos2SAT.cnf situacao3/resultado3.txt
+```
 
+**3. Interpretar o resultado** — o `.map` é lido automaticamente da pasta do resultado:
 
-def imprimir_estado(estado, titulo):
-    print(titulo)
-    for b in sorted(estado):
-        p, l = estado[b]
-        print(f'  {b}: ponto inicial p={p}, nivel l={l}')
+```bash
+python3 interpretar.py situacao3/resultado3.txt --verbose
+```
 
+```
+PLANO ENCONTRADO (6 acoes):
+1. t=0: mover bloco 'd' para CIMA de 'c' em p=0
+...
+ESTADO FINAL (t=6): ...
+RELACOES 'on' em t=6: ...
+```
 
-def imprimir_on(estado, t):
-    print(f"RELACOES 'on' em t={t}:")
-    for b, apoios in sorted(derivar_on(estado).items()):
-        if apoios == [TABLE]:
-            print(f'  {b} esta na MESA')
-        elif len(apoios) > 1:
-            print(f"  {b} esta sobre: {', '.join(apoios)} (ponte)")
-        elif apoios:
-            print(f'  {b} esta sobre: {apoios[0]}')
-        else:
-            print(f'  {b} esta sem apoio (!)')
+Os horizontes padrão (4, 5 e 6) são os mínimos. Para provar a otimalidade, rode com `T = 0, 1, 2, …` até o primeiro `SATISFIABLE`.
 
+### Atalho: automatizar os 4 passos
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('resultado', help='saida do minisat (resultadoN.txt)')
-    ap.add_argument('--map', default=None,
-                    help='arquivo .map (padrao: trab01_blocos2SAT.map na mesma pasta do resultado)')
-    ap.add_argument('--verbose', action='store_true', help='mostra estado final e relacoes on')
-    a = ap.parse_args()
+`rodar_cenarios.py` repete o fluxo acima para cada `T` crescente e já confere o plano com o verificador independente:
 
-    if a.map is None:
-        a.map = os.path.join(os.path.dirname(os.path.abspath(a.resultado)), 'trab01_blocos2SAT.map')
-    mapa = ler_mapa(a.map)
-    sat, verdadeiros = ler_resultado(a.resultado)
-    if not sat:
-        print('UNSATISFIABLE: nao existe plano com esse horizonte.')
-        return 1
+```bash
+python3 rodar_cenarios.py                        # sit1_sf4, sit2 e sit3
+python3 rodar_cenarios.py --todos                # inclui sit1_sf1..sf3
+python3 rodar_cenarios.py --cenarios sit3 --sem-ordem
+python3 rodar_cenarios.py --max-h 10 --minisat /caminho/minisat
+```
 
-    plano = acoes(mapa, verdadeiros)
-    print(f'PLANO ENCONTRADO ({len(plano)} acoes):')
-    for i, (t, b, y, p) in enumerate(plano, 1):
-        print(f'{i}. t={t}: {frase(b, y, p)}')
+Opções: `--max-h` (padrão 12), `--minisat`, `--saida` (diretório base das pastas), `--sem-ordem`.
 
-    if a.verbose:
-        estados = estados_por_tempo(mapa, verdadeiros)
-        tf = max(estados)
-        print()
-        imprimir_estado(estados[tf], f'ESTADO FINAL (t={tf}):')
-        print()
-        imprimir_on(estados[tf], tf)
-        print()
-        print('EVOLUCAO DO ESTADO:')
-        for t in sorted(estados):
-            desc = ', '.join(f'{b}=({p},{l})' for b, (p, l) in sorted(estados[t].items()))
-            print(f'  t={t}: {desc}')
-    return 0
+### Verificador independente (BFS, sem SAT)
 
+```bash
+python3 busca_exaustiva.py           # plano mínimo de todos os cenários
+python3 busca_exaustiva.py sit3
+```
 
-if __name__ == '__main__':
-    sys.exit(main())
+## Pastas e arquivos gerados
+
+Ao rodar, uma pasta por situação é criada contendo exatamente três arquivos:
+
+```
+situacao1/
+├── trab01_blocos2SAT.cnf     # fórmula em DIMACS
+├── trab01_blocos2SAT.map     # ID da variável -> símbolo (ex.: 42 mv(d,c,0,0))
+├── resultado1.txt            # saída bruta do minisat
+├── extras_sf1/               # (só com --todos) mesma estrutura, resultado_sf1.txt
+├── extras_sf2/               #                  resultado_sf2.txt
+└── extras_sf3/               #                  resultado_sf3.txt
+situacao2/
+├── trab01_blocos2SAT.cnf
+├── trab01_blocos2SAT.map
+└── resultado2.txt
+situacao3/
+├── trab01_blocos2SAT.cnf
+├── trab01_blocos2SAT.map
+└── resultado3.txt
+```
+
+O passo 1 cria as pastas com `.cnf` e `.map`; o `resultadoX.txt` aparece no passo 2. O `rodar_cenarios.py` faz tudo e guarda os arquivos do **menor horizonte satisfatível**.
+
+> **Regra de ouro:** o `.map` é indispensável. O minisat só devolve inteiros; sem o mapa correspondente à *mesma* execução, a saída não tem significado.
+
+## Como a codificação funciona (resumo)
+
+- **Variáveis base:** `at(b,p,t)` posição, `lev(b,l,t)` nível, `clr(b,t)` topo livre, `mv(b,y,p,t)` ação.
+- **Auxiliares:** `cb`/`cov` (cobertura de slots), `pos` e `o_on` (ordem parcial).
+- **11 grupos de cláusulas:** estado inicial, meta, unicidade de posição/nível, exclusão horizontal, estabilidade, clear, pré-condições, efeitos, frame axioms e ação única por passo.
+- **Ordem parcial** `φ1 <ₚ φ2`: `φ2(t)` só vale se `φ1(t')` valeu para algum `t' < t`.
+- A relação `on` **não** é codificada; é derivada em `interpretar.py` (`on(b,y)` ⇔ `lev(b)=l`, `lev(y)=l-1` e spans sobrepostos; vários apoios = ponte).
+- O menor `T` satisfatível é o comprimento mínimo do plano.
+
+## Exemplo de saída
+
+```
+=== sit3  (ordem parcial: sim) ===
+  T= 5:   1392 vars,    38962 clausulas -> UNSATISFIABLE
+  T= 6:   1638 vars,    46534 clausulas -> SATISFIABLE
+     1. t=0: mover bloco 'd' para CIMA de 'c' em p=0
+     ...
+  -> plano com 6 acoes; verificacao independente: plano legal e atinge a meta
+```
